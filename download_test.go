@@ -7,6 +7,7 @@ import (
 	"embed"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -217,6 +218,111 @@ func TestHandleDownloadFileExtractsTarGz(t *testing.T) {
 	}
 }
 
+func TestHandleDownloadFileExtractsTarHardLink(t *testing.T) {
+	archive := filepath.Join(t.TempDir(), "payload.tgz")
+	dest := t.TempDir()
+	writeTarGzEntries(t, archive, []tarEntry{
+		{name: "bin/tool", mode: 0o755, content: "payload"},
+		{name: "bin/tool-hard", mode: 0o755, typeflag: tar.TypeLink, linkname: "bin/tool"},
+	})
+
+	if err := handleDownloadFile(&Options{}, archive, dest); err != nil {
+		t.Fatalf("handleDownloadFile() error = %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dest, "bin", "tool-hard"))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(got) != "payload" {
+		t.Fatalf("hard link content = %q, want payload", got)
+	}
+}
+
+func TestHandleDownloadFileExtractsTarSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symlinks on Windows requires extra privileges")
+	}
+
+	archive := filepath.Join(t.TempDir(), "payload.tgz")
+	dest := t.TempDir()
+	writeTarGzEntries(t, archive, []tarEntry{
+		{name: "lib/tool", mode: 0o755, content: "payload"},
+		{name: "lib/tool-link", typeflag: tar.TypeSymlink, linkname: "tool"},
+	})
+
+	if err := handleDownloadFile(&Options{}, archive, dest); err != nil {
+		t.Fatalf("handleDownloadFile() error = %v", err)
+	}
+
+	link := filepath.Join(dest, "lib", "tool-link")
+	target, err := os.Readlink(link)
+	if err != nil {
+		t.Fatalf("Readlink() error = %v", err)
+	}
+	if target != "tool" {
+		t.Fatalf("symlink target = %q, want tool", target)
+	}
+
+	got, err := os.ReadFile(link)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(got) != "payload" {
+		t.Fatalf("symlink content = %q, want payload", got)
+	}
+}
+
+func TestHandleDownloadFileRejectsEscapingTarSymlink(t *testing.T) {
+	archive := filepath.Join(t.TempDir(), "payload.tgz")
+	writeTarGzEntries(t, archive, []tarEntry{
+		{name: "bin/tool-link", typeflag: tar.TypeSymlink, linkname: "../../etc/passwd"},
+	})
+
+	err := handleDownloadFile(&Options{}, archive, t.TempDir())
+	if err == nil {
+		t.Fatal("handleDownloadFile() expected escaping symlink error")
+	}
+	if !strings.Contains(err.Error(), "escapes extraction dir") {
+		t.Fatalf("handleDownloadFile() error = %v", err)
+	}
+}
+
+func TestValidateArchiveRejectsErrorPage(t *testing.T) {
+	archive := filepath.Join(t.TempDir(), "payload.tar.gz")
+	if err := os.WriteFile(archive, []byte("<html>not found</html>"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	err := validateArchive(archive)
+	if err == nil {
+		t.Fatal("validateArchive() expected error for html payload")
+	}
+	if !strings.Contains(err.Error(), "not a valid tar.gz archive") {
+		t.Fatalf("validateArchive() error = %v", err)
+	}
+}
+
+func TestValidateArchiveAcceptsGzipPayload(t *testing.T) {
+	archive := filepath.Join(t.TempDir(), "payload.tar.gz")
+	writeGzipFile(t, archive, "payload")
+
+	if err := validateArchive(archive); err != nil {
+		t.Fatalf("validateArchive() error = %v", err)
+	}
+}
+
+func TestValidateArchiveIgnoresPlainFiles(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "tool")
+	if err := os.WriteFile(file, []byte("payload"), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if err := validateArchive(file); err != nil {
+		t.Fatalf("validateArchive() error = %v", err)
+	}
+}
+
 func TestEmbedToDiskCopiesEmbeddedFiles(t *testing.T) {
 	dest := t.TempDir()
 
@@ -264,6 +370,24 @@ func writeZipArchive(t *testing.T, path string, files map[string]string) {
 func writeTarGzArchive(t *testing.T, path string, files map[string]string) {
 	t.Helper()
 
+	entries := make([]tarEntry, 0, len(files))
+	for name, content := range files {
+		entries = append(entries, tarEntry{name: name, mode: 0o644, content: content})
+	}
+	writeTarGzEntries(t, path, entries)
+}
+
+type tarEntry struct {
+	name     string
+	mode     int64
+	content  string
+	typeflag byte
+	linkname string
+}
+
+func writeTarGzEntries(t *testing.T, path string, entries []tarEntry) {
+	t.Helper()
+
 	file, err := os.Create(path)
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
@@ -276,17 +400,22 @@ func writeTarGzArchive(t *testing.T, path string, files map[string]string) {
 	tarWriter := tar.NewWriter(gzipWriter)
 	defer tarWriter.Close()
 
-	for name, content := range files {
+	for _, entry := range entries {
 		header := &tar.Header{
-			Name: name,
-			Mode: 0o644,
-			Size: int64(len(content)),
+			Name:     entry.name,
+			Mode:     entry.mode,
+			Size:     int64(len(entry.content)),
+			Typeflag: entry.typeflag,
+			Linkname: entry.linkname,
 		}
 		if err := tarWriter.WriteHeader(header); err != nil {
-			t.Fatalf("WriteHeader(%q) error = %v", name, err)
+			t.Fatalf("WriteHeader(%q) error = %v", entry.name, err)
 		}
-		if _, err := tarWriter.Write([]byte(content)); err != nil {
-			t.Fatalf("Write(%q) error = %v", name, err)
+		if entry.content == "" {
+			continue
+		}
+		if _, err := tarWriter.Write([]byte(entry.content)); err != nil {
+			t.Fatalf("Write(%q) error = %v", entry.name, err)
 		}
 	}
 }

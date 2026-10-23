@@ -4,12 +4,9 @@ import (
 	"context"
 	"errors"
 	"os"
-	"strconv"
-	"strings"
+	"path/filepath"
 
-	"github.com/sohaha/zlsgo/zarray"
 	"github.com/sohaha/zlsgo/zfile"
-	"github.com/sohaha/zlsgo/zshell"
 	"github.com/sohaha/zlsgo/zstring"
 )
 
@@ -25,7 +22,7 @@ func initTmpDir() string {
 		epath = os.Args[0]
 	}
 	hash, _ := zstring.Md5File(epath)
-	return zfile.RealPathMkdir(zfile.TmpPath() + "/" + hash)
+	return zfile.RealPathMkdir(filepath.Join(zfile.TmpPath(), hash))
 }
 
 func writeFile(path string, binary []byte) error {
@@ -60,40 +57,20 @@ func merge(e *Engine, ctx context.Context) (runCtx context.Context, cancel conte
 	return
 }
 
-func (e *Engine) command(attr []string) (string, error) {
+// argv returns the exact argument vector for the prepared binary.
+// Empty arguments are dropped, matching the historical behaviour.
+func (e *Engine) argv(attr []string) ([]string, error) {
 	if !zfile.FileExist(e.binFile) {
-		return "", errors.New("BinFile not set")
+		return nil, errors.New("BinFile not set")
 	}
 
-	args := append([]string{e.binFile}, zarray.Filter(attr, func(_ int, s string) bool {
-		return s != ""
-	})...)
-
-	return joinCommand(args), nil
-}
-
-func joinCommand(args []string) string {
-	return strings.Join(zarray.Map(args, func(_ int, arg string) string {
-		return quoteCommandArg(arg)
-	}), " ")
-}
-
-func quoteCommandArg(arg string) string {
-	if arg == "" {
-		return `""`
+	args := make([]string, 1, len(attr)+1)
+	args[0] = e.binFile
+	for _, arg := range attr {
+		if arg != "" {
+			args = append(args, arg)
+		}
 	}
 
-	if strings.ContainsAny(arg, " \t\"'") {
-		return strconv.Quote(arg)
-	}
-
-	return arg
-}
-
-var runCommand = func(ctx context.Context, command string, opt func(o *zshell.Options)) (code int, outStr string, errStr string, err error) {
-	return zshell.RunContext(ctx, command, opt)
-}
-
-var callbackRunCommand = func(ctx context.Context, command string, callback func(str string, isStdout bool), opt func(o *zshell.Options)) (<-chan int, func(string), error) {
-	return zshell.CallbackRunContext(ctx, command, callback, opt)
+	return args, nil
 }

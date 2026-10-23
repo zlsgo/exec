@@ -2,15 +2,14 @@ package exec
 
 import (
 	"context"
+	"embed"
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"testing"
 	"time"
 
 	"github.com/sohaha/zlsgo/zfile"
-	"github.com/sohaha/zlsgo/zshell"
 )
 
 func TestInitTmpDirReturnsExistingDirectory(t *testing.T) {
@@ -90,90 +89,78 @@ func TestMergeCancelsWhenEngineContextEnds(t *testing.T) {
 	}
 }
 
-func TestWrapOptionsUsesOverrideValues(t *testing.T) {
+func TestRunSpecUsesOverrideValues(t *testing.T) {
 	engine := &Engine{
 		options: &Options{
-			Env: []string{"ENGINE=1"},
-			Dir: "engine-dir",
+			Env:        []string{"ENGINE=1"},
+			Dir:        "engine-dir",
+			CloseStdin: true,
 		},
 	}
 
-	var shellOpt zshell.Options
-	engine.wrapOptions(func(o *Options) {
+	spec := engine.runSpec(func(o *Options) {
 		o.Env = []string{"REQUEST=2"}
 		o.Dir = "request-dir"
-	})(&shellOpt)
+		o.CloseStdin = false
+	})
 
-	if got, want := shellOpt.Dir, "request-dir"; got != want {
-		t.Fatalf("wrapped dir = %q, want %q", got, want)
+	if got, want := spec.Dir, "request-dir"; got != want {
+		t.Fatalf("spec dir = %q, want %q", got, want)
 	}
 
-	if !reflect.DeepEqual(shellOpt.Env, []string{"REQUEST=2"}) {
-		t.Fatalf("wrapped env = %#v, want override env", shellOpt.Env)
+	if !reflect.DeepEqual(spec.Env, []string{"REQUEST=2"}) {
+		t.Fatalf("spec env = %#v, want override env", spec.Env)
 	}
-}
 
-func TestJoinCommandQuotesArgumentsWithSpaces(t *testing.T) {
-	command := joinCommand([]string{`C:\Program Files\tool.cmd`, "hello world", "--quiet"})
-	want := `"C:\\Program Files\\tool.cmd" "hello world" --quiet`
-	if command != want {
-		t.Fatalf("joinCommand() = %q, want %q", command, want)
+	if spec.CloseStdin {
+		t.Fatal("spec CloseStdin = true, want override false")
 	}
 }
 
-func TestKeepRunReleasesMergedContextAfterProcessExit(t *testing.T) {
-	original := callbackRunCommand
-	defer func() {
-		callbackRunCommand = original
-	}()
-
-	done := make(chan int, 1)
-	ctxReleased := make(chan struct{}, 1)
-	callbackRunCommand = func(ctx context.Context, command string, callback func(str string, isStdout bool), opt func(o *zshell.Options)) (<-chan int, func(string), error) {
-		go func() {
-			<-ctx.Done()
-			ctxReleased <- struct{}{}
-		}()
-		done <- 0
-		close(done)
-		return done, func(string) {}, nil
-	}
-
-	engine := &Engine{
-		ctx:     context.Background(),
-		options: &Options{},
-		binFile: buildNoopBinaryPath(t),
-	}
-
-	codeCh, _, err := engine.KeepRun(context.Background(), nil, func(string, bool) {})
-	if err != nil {
-		t.Fatalf("KeepRun() error = %v", err)
-	}
-
-	if code := <-codeCh; code != 0 {
-		t.Fatalf("KeepRun() code = %d, want 0", code)
-	}
-
-	select {
-	case <-ctxReleased:
-	case <-time.After(2 * time.Second):
-		t.Fatal("merged KeepRun context was not released after process exit")
-	}
-}
-
-func buildNoopBinaryPath(t *testing.T) string {
-	t.Helper()
-
-	path := filepath.Join(t.TempDir(), "noop")
-	if runtime.GOOS == "windows" {
-		path += ".cmd"
-	} else {
-		path += ".sh"
-	}
-
-	if err := os.WriteFile(path, []byte("fixture"), 0o755); err != nil {
+func TestArgvKeepsArgumentBoundaries(t *testing.T) {
+	binFile := filepath.Join(t.TempDir(), "tool")
+	if err := os.WriteFile(binFile, []byte("fixture"), 0o755); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 
-	return path
+	engine := &Engine{binFile: binFile}
+	args := []string{`C:\Program Files\tool.cmd`, "hello world", `--sql=SELECT E'\n'`, "--quiet"}
+	argv, err := engine.argv(args)
+	if err != nil {
+		t.Fatalf("argv() error = %v", err)
+	}
+
+	want := append([]string{binFile}, args...)
+	if !reflect.DeepEqual(argv, want) {
+		t.Fatalf("argv() = %#v, want %#v", argv, want)
+	}
+}
+
+func TestKeepRunStopsOnContextCancel(t *testing.T) {
+	binFile := buildTestBinary(t, t.TempDir())
+	engine, err := New(embed.FS{}, func(options *Options) {
+		options.BinFile = binFile
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = engine.Release()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	codeCh, _, err := engine.KeepRun(ctx, []string{"sleep"}, func(string, bool) {})
+	if err != nil {
+		t.Fatalf("KeepRun() error = %v", err)
+	}
+	cancel()
+
+	select {
+	case code := <-codeCh:
+		if code == 0 {
+			t.Fatalf("KeepRun() code = %d, want non-zero after cancel", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("KeepRun() did not stop after context cancel")
+	}
 }

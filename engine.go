@@ -74,7 +74,7 @@ func toDisk(e *Engine) error {
 
 // Run executes the prepared binary synchronously and returns exit code, stdout, stderr and error.
 func (e *Engine) Run(ctx context.Context, attr []string, opt ...func(o *Options)) (code int, outStr string, errStr string, err error) {
-	command, err := e.command(attr)
+	argv, err := e.argv(attr)
 	if err != nil {
 		return -1, "", "", err
 	}
@@ -82,19 +82,19 @@ func (e *Engine) Run(ctx context.Context, attr []string, opt ...func(o *Options)
 	runCtx, cancel := merge(e, ctx)
 	defer cancel()
 
-	return runCommand(runCtx, command, e.wrapOptions(opt...))
+	return runCommand(runCtx, argv, e.runSpec(opt...))
 }
 
 // KeepRun executes the prepared binary in streaming mode.
 // It returns a code channel and an input function for writing to stdin.
 func (e *Engine) KeepRun(ctx context.Context, attr []string, callback func(str string, isStdout bool), opt ...func(o *Options)) (<-chan int, func(string), error) {
-	command, err := e.command(attr)
+	argv, err := e.argv(attr)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	runCtx, cancel := merge(e, ctx)
-	codeCh, input, err := callbackRunCommand(runCtx, command, callback, e.wrapOptions(opt...))
+	codeCh, input, err := callbackRunCommand(runCtx, argv, callback, e.runSpec(opt...))
 	if err != nil {
 		cancel()
 		return nil, nil, err

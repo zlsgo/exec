@@ -2,7 +2,6 @@ package exec
 
 import (
 	"github.com/sohaha/zlsgo/zfile"
-	"github.com/sohaha/zlsgo/zshell"
 	"github.com/sohaha/zlsgo/zutil"
 )
 
@@ -22,6 +21,9 @@ type Options struct {
 	Env []string
 	// Dir overrides the working directory for Run and KeepRun.
 	Dir string
+	// CloseStdin closes the child stdin immediately in KeepRun, so commands
+	// that read until EOF can finish without waiting for caller input.
+	CloseStdin bool
 }
 
 // BinFile returns the resolved binary path used by the current Engine instance.
@@ -29,15 +31,7 @@ func (e *Engine) BinFile() string {
 	return zfile.RealPath(e.binFile)
 }
 
-func (e *Engine) wrapOptions(o ...func(o *Options)) func(o *zshell.Options) {
-	opt := zutil.Optional(Options{Env: e.options.Env, Dir: e.options.Dir}, o...)
-
-	return func(o *zshell.Options) {
-		if opt.Env != nil {
-			o.Env = opt.Env
-		}
-		if opt.Dir != "" {
-			o.Dir = opt.Dir
-		}
-	}
+func (e *Engine) runSpec(o ...func(o *Options)) runSpec {
+	opt := zutil.Optional(Options{Env: e.options.Env, Dir: e.options.Dir, CloseStdin: e.options.CloseStdin}, o...)
+	return runSpec{Env: opt.Env, Dir: opt.Dir, CloseStdin: opt.CloseStdin}
 }

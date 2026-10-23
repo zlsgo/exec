@@ -1,6 +1,7 @@
 package exec
 
 import (
+	"context"
 	"embed"
 	"os"
 	"os/exec"
@@ -50,30 +51,32 @@ func TestNewRejectsMissingBinarySource(t *testing.T) {
 	}
 }
 
-func TestCommandSkipsEmptyArgs(t *testing.T) {
+func TestArgvSkipsEmptyArgs(t *testing.T) {
 	binFile := newTestScript(t)
 	engine := &Engine{binFile: binFile}
 
-	command, err := engine.command([]string{"--version", "", "--quiet"})
+	argv, err := engine.argv([]string{"--version", "", "--quiet"})
 	if err != nil {
-		t.Fatalf("command() error = %v", err)
+		t.Fatalf("argv() error = %v", err)
 	}
 
-	if strings.Contains(command, "  ") {
-		t.Fatalf("command() = %q, want filtered empty args", command)
+	want := []string{binFile, "--version", "--quiet"}
+	if len(argv) != len(want) {
+		t.Fatalf("argv() = %#v, want %#v", argv, want)
 	}
-
-	if got, want := command, binFile+" --version --quiet"; got != want {
-		t.Fatalf("command() = %q, want %q", got, want)
+	for i := range want {
+		if argv[i] != want[i] {
+			t.Fatalf("argv()[%d] = %q, want %q", i, argv[i], want[i])
+		}
 	}
 }
 
-func TestCommandRequiresExistingBinary(t *testing.T) {
+func TestArgvRequiresExistingBinary(t *testing.T) {
 	engine := &Engine{binFile: filepath.Join(t.TempDir(), "missing")}
 
-	_, err := engine.command(nil)
+	_, err := engine.argv(nil)
 	if err == nil {
-		t.Fatal("command() expected error when binary does not exist")
+		t.Fatal("argv() expected error when binary does not exist")
 	}
 }
 
@@ -97,7 +100,7 @@ func TestReleaseKeepsExternalBinDirectory(t *testing.T) {
 	}
 }
 
-func TestRunUsesQuotedPathAndOverrideOptions(t *testing.T) {
+func TestRunPassesExactArgvAndOverrideOptions(t *testing.T) {
 	binFile := buildTestBinary(t, filepath.Join(t.TempDir(), "bin space"))
 	workDir := filepath.Join(t.TempDir(), "work space")
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
@@ -114,7 +117,13 @@ func TestRunUsesQuotedPathAndOverrideOptions(t *testing.T) {
 		_ = engine.Release()
 	})
 
-	code, out, errOut, err := engine.Run(nil, []string{"value with spaces"}, func(options *Options) {
+	args := []string{
+		"value with spaces",
+		`C:\Users\x\data`,
+		`SELECT E'\\n' ... 'it''s'`,
+		`--flag="quoted value"`,
+	}
+	code, out, errOut, err := engine.Run(nil, args, func(options *Options) {
 		options.Env = []string{"EXEC_TEST_TOKEN=override"}
 		options.Dir = workDir
 	})
@@ -125,17 +134,76 @@ func TestRunUsesQuotedPathAndOverrideOptions(t *testing.T) {
 		t.Fatalf("Run() exit code = %d, stderr = %q", code, errOut)
 	}
 
-	normalizedOut := strings.ReplaceAll(strings.TrimSpace(out), "\\", "/")
 	normalizedDir := strings.ReplaceAll(workDir, "\\", "/")
 	// On macOS, /var/folders is a symlink to /private/var/folders,
 	// so os.Getwd() returns the resolved path. We need to compare
 	// the resolved path with the actual output.
 	realDir, err := filepath.EvalSymlinks(workDir)
 	if err == nil {
-		normalizedDir = strings.ReplaceAll(realDir, "\", "/")
+		normalizedDir = strings.ReplaceAll(realDir, "\\", "/")
 	}
-	if !strings.Contains(normalizedOut, "override|"+normalizedDir+"|value with spaces") {
-		t.Fatalf("Run() output = %q", out)
+	want := "override|" + normalizedDir
+	for _, arg := range args {
+		want += "|" + arg
+	}
+	if got := strings.TrimSpace(out); got != want {
+		t.Fatalf("Run() output = %q, want %q", got, want)
+	}
+}
+
+func TestKeepRunWritesStdin(t *testing.T) {
+	binFile := buildTestBinary(t, t.TempDir())
+
+	engine, err := New(embed.FS{}, func(options *Options) {
+		options.BinFile = binFile
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = engine.Release()
+	})
+
+	var lines []string
+	codeCh, input, err := engine.KeepRun(context.Background(), []string{"readline"}, func(str string, isStdout bool) {
+		lines = append(lines, str)
+	})
+	if err != nil {
+		t.Fatalf("KeepRun() error = %v", err)
+	}
+	input("hello stdin\n")
+
+	if code := <-codeCh; code != 0 {
+		t.Fatalf("KeepRun() exit code = %d", code)
+	}
+	if got, want := strings.Join(lines, "\n"), "hello stdin"; got != want {
+		t.Fatalf("KeepRun() lines = %q, want %q", got, want)
+	}
+}
+
+func TestKeepRunClosesStdinWhenRequested(t *testing.T) {
+	binFile := buildTestBinary(t, t.TempDir())
+
+	engine, err := New(embed.FS{}, func(options *Options) {
+		options.BinFile = binFile
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = engine.Release()
+	})
+
+	codeCh, input, err := engine.KeepRun(context.Background(), []string{"cat"}, func(string, bool) {}, func(options *Options) {
+		options.CloseStdin = true
+	})
+	if err != nil {
+		t.Fatalf("KeepRun() error = %v", err)
+	}
+	input("ignored after CloseStdin")
+
+	if code := <-codeCh; code != 0 {
+		t.Fatalf("KeepRun() exit code = %d", code)
 	}
 }
 

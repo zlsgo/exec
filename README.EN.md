@@ -19,9 +19,9 @@ It is useful when you want to wrap CLI tools, helper processes, or embedded exec
 - **Unified entry**: create an `Engine` with `New` and manage prepare/run/release in one place
 - **Multiple sources**: supports local files, `embed.FS`, and `DownloadUrl`
 - **Custom download handling**: keeps legacy `DownloadHandler` compatibility and also supports `DownloadHandlerWithDir`
-- **Runtime control**: supports environment variables, working directory, sync run, and streaming run
+- **Runtime control**: supports environment variables, working directory, sync run, and streaming run; arguments are passed as a literal argv, never re-parsed by a shell
 - **Clear safety boundary**: external `BinFile` targets are not deleted by `Release()`
-- **Download format support**: supports plain files, `.zip`, `.tar.gz` / `.tgz`, and single-file `.gz`
+- **Download format support**: supports plain files, `.zip`, `.tar.gz` / `.tgz`, and single-file `.gz`, preserving hard links and symlinks on extraction
 
 ## 🚀 QuickStart
 

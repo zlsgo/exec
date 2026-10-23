@@ -70,6 +70,12 @@ func handleDownloadFile(opt *Options, file string, dir string) error {
 		return opt.DownloadHandler(file)
 	}
 
+	// Downloads are cached before extraction, so validate here as well:
+	// a previously cached error page must not be reused.
+	if err := validateArchive(file); err != nil {
+		return err
+	}
+
 	switch archiveKind(file) {
 	case "tar.gz":
 		return ungz(opt, file, dir)
@@ -110,6 +116,46 @@ func archiveKind(file string) string {
 	default:
 		return ""
 	}
+}
+
+// validateArchive rejects payloads that only look like an archive by name.
+// Download endpoints often answer 404 with an HTML page while still reporting
+// success, which would otherwise be cached and extracted as garbage.
+func validateArchive(file string) error {
+	kind := archiveKind(file)
+	if kind == "" {
+		return nil
+	}
+
+	f, err := os.Open(file)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	var magic [4]byte
+	n, err := io.ReadFull(f, magic[:])
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("download %s is empty", filepath.Base(file))
+	}
+
+	valid := false
+	switch kind {
+	case "tar.gz", "gz":
+		valid = n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b
+	case "zip":
+		valid = n == 4 && (string(magic[:]) == "PK\x03\x04" ||
+			string(magic[:]) == "PK\x05\x06" ||
+			string(magic[:]) == "PK\x07\x08")
+	}
+	if !valid {
+		return fmt.Errorf("download %s is not a valid %s archive: the server may have returned an error page", filepath.Base(file), kind)
+	}
+
+	return nil
 }
 
 func resolveOutputPath(opt *Options, file string, dir string) (string, error) {
@@ -207,21 +253,48 @@ func ungz(opt *Options, file string, dir string) error {
 			if err := os.MkdirAll(path, info.Mode()); err != nil {
 				return err
 			}
-		case tar.TypeReg:
+		case tar.TypeReg, tar.TypeRegA:
 			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 				return err
 			}
-			file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode())
+			outFile, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode())
 			if err != nil {
 				return err
 			}
 
-			if _, err = io.Copy(file, tarReader); err != nil {
-				file.Close()
+			if _, err = io.Copy(outFile, tarReader); err != nil {
+				outFile.Close()
 				return err
 			}
-			if err := file.Close(); err != nil {
+			if err := outFile.Close(); err != nil {
 				return err
+			}
+		case tar.TypeLink:
+			target, err := safeExtractPath(dir, header.Linkname)
+			if err != nil {
+				return err
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return err
+			}
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			if err := os.Link(target, path); err != nil {
+				return fmt.Errorf("link %s -> %s: %w", header.Name, header.Linkname, err)
+			}
+		case tar.TypeSymlink:
+			if err := checkSymlinkTarget(dir, path, header.Linkname); err != nil {
+				return err
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return err
+			}
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			if err := os.Symlink(header.Linkname, path); err != nil {
+				return fmt.Errorf("symlink %s -> %s: %w", header.Name, header.Linkname, err)
 			}
 		default:
 			return fmt.Errorf("unsupported file type: %v", header.Typeflag)
@@ -281,4 +354,23 @@ func safeExtractPath(dir, name string) (string, error) {
 	}
 
 	return target, nil
+}
+
+// checkSymlinkTarget rejects links that resolve outside the extraction root.
+// Relative targets are resolved from the link location, matching tar semantics.
+func checkSymlinkTarget(dir, linkPath, linkname string) error {
+	target := linkname
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(linkPath), target)
+	}
+
+	relative, err := filepath.Rel(filepath.Clean(dir), filepath.Clean(target))
+	if err != nil {
+		return fmt.Errorf("invalid symlink target: %s -> %s", linkPath, linkname)
+	}
+	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("symlink %s escapes extraction dir: %s", linkPath, linkname)
+	}
+
+	return nil
 }
